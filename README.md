@@ -6,16 +6,21 @@ A Linux system tray application that displays real-time Claude API usage and rat
 
 ## Features
 
-- System tray icon with color indicator (green / orange / red) based on current usage level
+- System tray icon with color indicator (green / orange / red) based on **5-hour window** usage
+- Tray icon switches to `!` when active incidents are detected
 - Shows usage for two rate-limit windows: **5-hour** and **7-day**
 - **7-day forecast** based on current consumption rate
 - Live **status feed** from [status.claude.com](https://status.claude.com) with clickable incident links
-- Auto-refresh every 30 minutes (spinner animation while loading)
+- Auto-refresh every 30 minutes, plus on every menu open (spinner animation while loading)
+- Manual **⟳ Refresh** button in the menu
+- **Add to autostart** directly from the menu (GNOME/XDG autostart)
 - Reads your existing Claude CLI session — no additional API key needed
 
 ## Screenshot
 
 ![Claude Status Tray Demo](demo.png)
+
+> **Note:** This app has only been tested on Ubuntu 24.04 so far.
 
 ## Requirements
 
@@ -54,18 +59,17 @@ chmod +x claude_status_tray.py
 
 ### Add to autostart (GNOME)
 
-Create a `.desktop` file and copy it to your autostart directory:
+The easiest way is to use the built-in menu option: open the tray menu and click **"Add to autostart"**. This creates the `.desktop` file automatically and the entry changes to **"✓ Autostart enabled"** once done.
+
+Alternatively, create the file manually:
 
 ```bash
 cat > ~/.config/autostart/claude-status-tray.desktop << EOF
 [Desktop Entry]
 Type=Application
 Name=Claude Status Tray
-Comment=Shows Claude CLI usage in the system tray
-Exec=/path/to/claude-status-tray/claude_status_tray.py
-Terminal=false
-Categories=Utility;
-StartupNotify=false
+Exec=python3 /path/to/claude-status-tray/claude_status_tray.py
+X-GNOME-Autostart-enabled=true
 EOF
 ```
 

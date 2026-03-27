@@ -73,12 +73,15 @@ def create_icons():
 
 # ── Data fetching ────────────────────────────────────────────────────
 
-def _time_until(reset_ts):
+def _time_until(reset_ts, show_days=False):
     diff = reset_ts - time.time()
     if diff <= 0:
         return "now"
     hours = int(diff // 3600)
     mins = int((diff % 3600) // 60)
+    if show_days and hours >= 24:
+        days = hours // 24
+        return f"{days}d {hours % 24}h"
     if hours > 0:
         return f"{hours}h {mins}m"
     return f"{mins}m"
@@ -258,7 +261,7 @@ class ClaudeTray:
         self.menu.connect("show", lambda _: self._fetch_bg())
 
         # ── Header ──
-        header = Gtk.MenuItem(label="Claude Code Usage")
+        header = Gtk.MenuItem(label="Claude Subscription Usage")
         header.set_sensitive(False)
         self.menu.append(header)
 
@@ -319,6 +322,12 @@ class ClaudeTray:
         self.item_refresh.connect("activate", lambda _: self._fetch_bg())
         self.menu.append(self.item_refresh)
 
+        # ── Autostart ──
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.item_autostart = Gtk.MenuItem()
+        self._update_autostart_item()
+        self.menu.append(self.item_autostart)
+
         # ── Quit ──
         item_quit = Gtk.MenuItem(label="Quit")
         item_quit.connect("activate", lambda _: Gtk.main_quit())
@@ -374,7 +383,7 @@ class ClaudeTray:
         self.lbl_7d_bar.set_label(_bar(d7))
         if data.get("d7_reset"):
             self.lbl_7d_reset.set_label(
-                f"Resets {_local_time(data['d7_reset'])} · {_time_until(data['d7_reset'])} left"
+                f"Resets {_local_time(data['d7_reset'])} · {_time_until(data['d7_reset'], show_days=True)} left"
             )
             self.lbl_7d_forecast.set_label(self._forecast_7d(d7, data["d7_reset"]))
         else:
@@ -465,6 +474,44 @@ class ClaudeTray:
     def _open_link(_widget, url):
         import webbrowser
         webbrowser.open(url)
+
+    # ── Autostart ──
+
+    @staticmethod
+    def _autostart_path():
+        return Path.home() / ".config" / "autostart" / "claude-status-tray.desktop"
+
+    @staticmethod
+    def _is_autostart_enabled():
+        desktop = Path.home() / ".config" / "autostart" / "claude-status-tray.desktop"
+        return desktop.exists()
+
+    def _update_autostart_item(self):
+        if self._is_autostart_enabled():
+            self.item_autostart.set_label("✓ Autostart enabled")
+            self.item_autostart.set_sensitive(False)
+        else:
+            self.item_autostart.set_label("Add to autostart")
+            self.item_autostart.set_sensitive(True)
+            try:
+                self.item_autostart.disconnect_by_func(self._enable_autostart)
+            except TypeError:
+                pass
+            self.item_autostart.connect("activate", self._enable_autostart)
+
+    def _enable_autostart(self, _widget):
+        script_path = Path(os.path.abspath(__file__))
+        desktop_dir = Path.home() / ".config" / "autostart"
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+        desktop_content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Claude Status Tray\n"
+            f"Exec=python3 {script_path}\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+        self._autostart_path().write_text(desktop_content)
+        self._update_autostart_item()
 
     # ── Refresh with spinner ──
 
