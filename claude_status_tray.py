@@ -258,7 +258,6 @@ class ClaudeTray:
     def _build_menu(self):
         self.menu = Gtk.Menu()
         self.menu.set_name("usage-menu")
-        self.menu.connect("show", lambda _: self._fetch_bg())
 
         # ── Header ──
         header = Gtk.MenuItem(label="Claude Subscription Usage")
