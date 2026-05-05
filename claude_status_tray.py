@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Claude Usage Tray Icon - Shows Claude rate limits in the system tray."""
+"""Claude/Ollama Usage Tray Icon - Shows usage limits in the system tray."""
 
+import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -51,24 +53,25 @@ ICON_COLORS = {
 ICON_DIR = "/tmp"
 
 
-def _icon_path(color, alert=False):
+def _icon_path(color, alert=False, prefix="claude"):
     suffix = "-alert" if alert else ""
-    return f"{ICON_DIR}/claude-tray-{color}{suffix}.svg"
+    return f"{ICON_DIR}/{prefix}-tray-{color}{suffix}.svg"
 
 
 def create_icons():
-    for name, hex_color in ICON_COLORS.items():
-        for alert in (False, True):
-            path = _icon_path(name, alert)
-            if alert:
-                letter, size, y, stroke = "!", 48, 48, 2
-            else:
-                letter, size, y, stroke = "C", 36, 44, 0
-            with open(path, "w") as f:
-                f.write(ICON_TEMPLATE.format(
-                    color=hex_color, letter=letter,
-                    size=size, y=y, stroke=stroke,
-                ))
+    for prefix, base_letter in (("claude", "C"), ("ollama", "O"), ("codex", "X")):
+        for name, hex_color in ICON_COLORS.items():
+            for alert in (False, True):
+                path = _icon_path(name, alert, prefix)
+                if alert:
+                    letter, size, y, stroke = "!", 48, 48, 2
+                else:
+                    letter, size, y, stroke = base_letter, 36, 44, 0
+                with open(path, "w") as f:
+                    f.write(ICON_TEMPLATE.format(
+                        color=hex_color, letter=letter,
+                        size=size, y=y, stroke=stroke,
+                    ))
 
 
 # ── Data fetching ────────────────────────────────────────────────────
@@ -165,6 +168,293 @@ def fetch_usage_data():
         return str(e)
 
 
+# ── Ollama usage (via Snap Chromium CDP) ────────────────────────────
+
+OLLAMA_CDP_PORT = 9224
+OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
+
+
+def _cdp_evaluate(ws_url, expression, timeout=10):
+    """Evaluate JS in a CDP tab using a raw WebSocket (no async deps)."""
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(ws_url)
+    host = parsed.hostname
+    port = parsed.port or 80
+    path = parsed.path
+
+    sock = socket.create_connection((host, port), timeout=timeout)
+    # WebSocket handshake
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    handshake = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(handshake.encode())
+
+    # Read handshake response
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += sock.recv(4096)
+
+    # Send CDP message
+    msg = json.dumps({
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": {"expression": expression},
+    }).encode()
+
+    # Build WebSocket frame (text, masked with zero mask for local)
+    frame = bytearray()
+    frame.append(0x81)  # FIN + text
+    length = len(msg)
+    if length < 126:
+        frame.append(0x80 | length)
+    elif length < 65536:
+        frame.append(0x80 | 126)
+        frame.extend(length.to_bytes(2, "big"))
+    else:
+        frame.append(0x80 | 127)
+        frame.extend(length.to_bytes(8, "big"))
+    frame.extend(b"\x00\x00\x00\x00")  # zero mask key
+    frame.extend(msg)
+    sock.sendall(frame)
+
+    # Read response frames
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) >= 2:
+            payload_len = data[1] & 0x7F
+            offset = 2
+            if payload_len == 126:
+                if len(data) < 4:
+                    continue
+                payload_len = int.from_bytes(data[2:4], "big")
+                offset = 4
+            elif payload_len == 127:
+                if len(data) < 10:
+                    continue
+                payload_len = int.from_bytes(data[2:10], "big")
+                offset = 10
+            if len(data) >= offset + payload_len:
+                payload = data[offset:offset + payload_len]
+                sock.close()
+                return json.loads(payload)
+
+    sock.close()
+    return None
+
+
+def fetch_ollama_usage():
+    """Open ollama.com/settings in Snap Chromium, scrape usage, close tab."""
+    tab_id = None
+    try:
+        # Open a new tab
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{OLLAMA_CDP_PORT}/json/new?{OLLAMA_SETTINGS_URL}",
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tab_info = json.loads(resp.read())
+        tab_id = tab_info["id"]
+        ws_url = tab_info["webSocketDebuggerUrl"]
+
+        # Poll until the page has loaded (up to 10s)
+        for _ in range(20):
+            time.sleep(0.5)
+            result = _cdp_evaluate(ws_url, "document.readyState")
+            if result:
+                state = result.get("result", {}).get("result", {}).get("value")
+                if state == "complete":
+                    break
+
+        # Extract usage data
+        result = _cdp_evaluate(ws_url, """
+            (function() {
+                var text = document.body.innerText;
+                var sessionMatch = text.match(/Session usage\\s*([\\d.]+)% used\\s*Resets in ([^\\n]+)/);
+                var weeklyMatch = text.match(/Weekly usage\\s*([\\d.]+)% used\\s*Resets in ([^\\n]+)/);
+                var planMatch = text.match(/Cloud Usage\\s*(\\w+)/);
+                return JSON.stringify({
+                    session_pct: sessionMatch ? parseFloat(sessionMatch[1]) : null,
+                    session_reset: sessionMatch ? sessionMatch[2].trim() : null,
+                    weekly_pct: weeklyMatch ? parseFloat(weeklyMatch[1]) : null,
+                    weekly_reset: weeklyMatch ? weeklyMatch[2].trim() : null,
+                    plan: planMatch ? planMatch[1] : "Unknown"
+                });
+            })()
+        """)
+
+        if not result:
+            return "Failed to read Ollama page data."
+
+        value = result.get("result", {}).get("result", {}).get("value")
+        if not value:
+            return "No data from Ollama settings page."
+
+        data = json.loads(value)
+        if data.get("session_pct") is None and data.get("weekly_pct") is None:
+            return "Could not parse Ollama usage. Make sure you're logged in at ollama.com/settings."
+
+        return {
+            "session_pct": data.get("session_pct", 0),
+            "session_reset": data.get("session_reset", ""),
+            "weekly_pct": data.get("weekly_pct", 0),
+            "weekly_reset": data.get("weekly_reset", ""),
+            "plan": data.get("plan", "Unknown"),
+        }
+
+    except Exception as e:
+        return f"Ollama fetch error: {e}"
+
+    finally:
+        # Always close the tab
+        if tab_id:
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{OLLAMA_CDP_PORT}/json/close/{tab_id}",
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+
+# ── Codex usage (via codex CLI) ─────────────────────────────────────
+
+_CODEX_BIN_CACHE = None
+
+
+def _resolve_codex_binary():
+    """Locate the codex CLI even when the tray is launched without nvm in PATH."""
+    global _CODEX_BIN_CACHE
+    if _CODEX_BIN_CACHE is not None:
+        return _CODEX_BIN_CACHE or None
+
+    found = shutil.which("codex")
+    if not found:
+        candidates = []
+        home = os.path.expanduser("~")
+        candidates.extend(sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True))
+        candidates.append(os.path.join(home, ".local/bin/codex"))
+        candidates.append(os.path.join(home, "bin/codex"))
+        candidates.append("/usr/local/bin/codex")
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                found = path
+                break
+
+    _CODEX_BIN_CACHE = found or ""
+    return found
+
+
+def _parse_codex_rate_limits_legacy(text):
+    """Old codex format (<=0.124): a {"type":"codex.rate_limits", ...} websocket message."""
+    json_match = re.search(r'(\{"type":"codex\.rate_limits".*?\})\s*$', text, re.MULTILINE)
+    if not json_match:
+        json_match = re.search(r'Received message (\{"type":"codex\.rate_limits".*?\})', text)
+    if not json_match:
+        return None
+    try:
+        data = json.loads(json_match.group(1))
+    except json.JSONDecodeError:
+        return None
+    rl = data.get("rate_limits", {})
+    primary = rl.get("primary", {})
+    secondary = rl.get("secondary", {})
+    return {
+        "primary_pct": primary.get("used_percent", 0),
+        "primary_window_min": primary.get("window_minutes", 300),
+        "primary_reset_ts": primary.get("reset_at"),
+        "primary_reset_secs": primary.get("reset_after_seconds"),
+        "secondary_pct": secondary.get("used_percent", 0),
+        "secondary_window_min": secondary.get("window_minutes", 10080),
+        "secondary_reset_ts": secondary.get("reset_at"),
+        "secondary_reset_secs": secondary.get("reset_after_seconds"),
+        "plan": data.get("plan_type", "unknown"),
+        "allowed": rl.get("allowed", True),
+        "limit_reached": rl.get("limit_reached", False),
+    }
+
+
+def _parse_codex_rate_limits_headers(text):
+    """New codex format (>=0.125): X-Codex-* fields embedded in websocket event JSON."""
+    def _find(name):
+        m = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text)
+        return m.group(1) if m else None
+
+    plan = _find("X-Codex-Plan-Type")
+    primary_raw = _find("X-Codex-Primary-Used-Percent")
+    if plan is None and primary_raw is None:
+        return None
+
+    def _to_int(v, default=None):
+        if v is None or v == "":
+            return default
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+    limit_reached = "usage_limit_reached" in text
+    return {
+        "primary_pct": _to_int(primary_raw, 0),
+        "primary_window_min": _to_int(_find("X-Codex-Primary-Window-Minutes"), 300),
+        "primary_reset_ts": _to_int(_find("X-Codex-Primary-Reset-At")),
+        "primary_reset_secs": _to_int(_find("X-Codex-Primary-Reset-After-Seconds")),
+        "secondary_pct": _to_int(_find("X-Codex-Secondary-Used-Percent"), 0),
+        "secondary_window_min": _to_int(_find("X-Codex-Secondary-Window-Minutes"), 10080),
+        "secondary_reset_ts": _to_int(_find("X-Codex-Secondary-Reset-At")),
+        "secondary_reset_secs": _to_int(_find("X-Codex-Secondary-Reset-After-Seconds")),
+        "plan": plan or "unknown",
+        "allowed": not limit_reached,
+        "limit_reached": limit_reached,
+    }
+
+
+def fetch_codex_usage():
+    """Fetch Codex usage by running a minimal codex exec and parsing rate_limits."""
+    codex_bin = _resolve_codex_binary()
+    if not codex_bin:
+        return "'codex' not found in PATH."
+    try:
+        env = os.environ.copy()
+        env["RUST_LOG"] = "trace"
+        bin_dir = os.path.dirname(codex_bin)
+        if bin_dir and bin_dir not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
+        result = subprocess.run(
+            [codex_bin, "exec", "say ok"],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, env=env,
+        )
+
+        output = result.stdout + "\n" + result.stderr
+
+        parsed = _parse_codex_rate_limits_legacy(output)
+        if parsed is None:
+            parsed = _parse_codex_rate_limits_headers(output)
+        if parsed is None:
+            return "No rate limit data from Codex CLI."
+        return parsed
+
+    except FileNotFoundError:
+        return "'codex' not found in PATH."
+    except subprocess.TimeoutExpired:
+        return "Timeout fetching Codex data."
+    except Exception as e:
+        return f"Codex fetch error: {e}"
+
+
 # ── Status feed ──────────────────────────────────────────────────────
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
@@ -238,6 +528,10 @@ class ClaudeTray:
         self._fetching = False
         self._spinner_idx = 0
         self._spinner_tid = None
+        self._mode = "claude"  # "claude", "ollama", or "codex"
+        cfg = self._load_config()
+        self._disabled_providers = set(cfg.get("disabled_providers", []))
+        self._disabled_providers.discard(self._mode)
 
         self.indicator = AyatanaAppIndicator3.Indicator.new(
             "claude-usage-tray",
@@ -251,7 +545,7 @@ class ClaudeTray:
         self._build_menu()
         self.indicator.set_menu(self.menu)
 
-        # Initial fetch + periodic refresh every 5 min
+        # Initial fetch + periodic refresh every 30 min
         self._fetch_bg()
         GLib.timeout_add_seconds(1800, self._fetch_bg)
 
@@ -260,9 +554,9 @@ class ClaudeTray:
         self.menu.set_name("usage-menu")
 
         # ── Header ──
-        header = Gtk.MenuItem(label="Claude Subscription Usage")
-        header.set_sensitive(False)
-        self.menu.append(header)
+        self.lbl_header = Gtk.MenuItem(label="Claude Subscription Usage")
+        self.lbl_header.set_sensitive(False)
+        self.menu.append(self.lbl_header)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -321,11 +615,35 @@ class ClaudeTray:
         self.item_refresh.connect("activate", lambda _: self._fetch_bg())
         self.menu.append(self.item_refresh)
 
+        # ── Switch mode ──
+        # Sentinel marks the position; the real item is recreated on every rebuild
+        # because the AppIndicator/dbusmenu bridge does not drop the submenu arrow
+        # when only set_submenu(None) is called on an existing item.
+        self._switch_anchor = Gtk.SeparatorMenuItem()
+        self._switch_anchor.set_visible(False)
+        self.menu.append(self._switch_anchor)
+        self.item_switch = None
+        self._rebuild_switch_menu()
+
         # ── Autostart ──
         self.menu.append(Gtk.SeparatorMenuItem())
         self.item_autostart = Gtk.MenuItem()
         self._update_autostart_item()
         self.menu.append(self.item_autostart)
+
+        # ── Enable/disable providers ──
+        providers_menu = Gtk.Menu()
+        self._provider_check_items = {}
+        for mode_id, mode_label in self._ALL_PROVIDERS:
+            check = Gtk.CheckMenuItem(label=mode_label)
+            check.set_active(mode_id not in self._disabled_providers)
+            handler_id = check.connect("toggled", self._toggle_provider, mode_id)
+            self._provider_check_items[mode_id] = (check, handler_id)
+            providers_menu.append(check)
+        self._update_provider_check_sensitivity()
+        self.item_providers = Gtk.MenuItem(label="Providers…")
+        self.item_providers.set_submenu(providers_menu)
+        self.menu.append(self.item_providers)
 
         # ── Quit ──
         item_quit = Gtk.MenuItem(label="Quit")
@@ -337,28 +655,37 @@ class ClaudeTray:
         # Set initial loading state
         self._set_loading()
 
+    @staticmethod
+    def _set_optional(item, text):
+        """Set a menu item's label and hide the row entirely if empty."""
+        item.set_label(text or "")
+        if text:
+            item.show()
+        else:
+            item.hide()
+
     def _set_loading(self):
         self.lbl_5h_title.set_label("5-Hour Window")
         self.lbl_5h_bar.set_label("Loading…")
-        self.lbl_5h_reset.set_label("")
+        self._set_optional(self.lbl_5h_reset, "")
         self.lbl_7d_title.set_label("7-Day Window")
         self.lbl_7d_bar.set_label("Loading…")
-        self.lbl_7d_reset.set_label("")
-        self.lbl_7d_forecast.set_label("")
-        self.lbl_plan.set_label("")
-        self.lbl_overage.set_label("")
+        self._set_optional(self.lbl_7d_reset, "")
+        self._set_optional(self.lbl_7d_forecast, "")
+        self._set_optional(self.lbl_plan, "")
+        self._set_optional(self.lbl_overage, "")
 
     def _update_menu(self, data):
         if isinstance(data, str):
             self.lbl_5h_title.set_label("5-Hour Window")
             self.lbl_5h_bar.set_label(f"⚠️ {data}")
-            self.lbl_5h_reset.set_label("")
+            self._set_optional(self.lbl_5h_reset, "")
             self.lbl_7d_title.set_label("7-Day Window")
             self.lbl_7d_bar.set_label("")
-            self.lbl_7d_reset.set_label("")
-            self.lbl_7d_forecast.set_label("")
-            self.lbl_plan.set_label("")
-            self.lbl_overage.set_label("")
+            self._set_optional(self.lbl_7d_reset, "")
+            self._set_optional(self.lbl_7d_forecast, "")
+            self._set_optional(self.lbl_plan, "")
+            self._set_optional(self.lbl_overage, "")
             return
 
         # 5-Hour
@@ -367,12 +694,11 @@ class ClaudeTray:
             f"{_status_icon(data['h5_status'])} 5-Hour Window        {h5 * 100:.0f}%"
         )
         self.lbl_5h_bar.set_label(_bar(h5))
-        if data.get("h5_reset"):
-            self.lbl_5h_reset.set_label(
-                f"Resets {_local_time(data['h5_reset'])} · {_time_until(data['h5_reset'])} left"
-            )
-        else:
-            self.lbl_5h_reset.set_label("")
+        self._set_optional(
+            self.lbl_5h_reset,
+            f"Resets {_local_time(data['h5_reset'])} · {_time_until(data['h5_reset'])} left"
+            if data.get("h5_reset") else "",
+        )
 
         # 7-Day
         d7 = data["d7_util"]
@@ -381,16 +707,17 @@ class ClaudeTray:
         )
         self.lbl_7d_bar.set_label(_bar(d7))
         if data.get("d7_reset"):
-            self.lbl_7d_reset.set_label(
-                f"Resets {_local_time(data['d7_reset'])} · {_time_until(data['d7_reset'], show_days=True)} left"
+            self._set_optional(
+                self.lbl_7d_reset,
+                f"Resets {_local_time(data['d7_reset'])} · {_time_until(data['d7_reset'], show_days=True)} left",
             )
-            self.lbl_7d_forecast.set_label(self._forecast_7d(d7, data["d7_reset"]))
+            self._set_optional(self.lbl_7d_forecast, self._forecast_7d(d7, data["d7_reset"]))
         else:
-            self.lbl_7d_reset.set_label("")
-            self.lbl_7d_forecast.set_label("")
+            self._set_optional(self.lbl_7d_reset, "")
+            self._set_optional(self.lbl_7d_forecast, "")
 
         # Plan
-        self.lbl_plan.set_label(f"Plan: {data['plan']}")
+        self._set_optional(self.lbl_plan, f"Plan: {data['plan']}")
 
         # Overage
         overage = data.get("overage_status", "")
@@ -401,26 +728,214 @@ class ClaudeTray:
                 "seat_tier_level_disabled": "N/A for plan",
             }.get(data.get("overage_reason", ""), data.get("overage_reason", ""))
             lbl = reason if overage == "rejected" else overage
-            self.lbl_overage.set_label(f"Extra Usage: {lbl}")
+            self._set_optional(self.lbl_overage, f"Extra Usage: {lbl}")
         else:
-            self.lbl_overage.set_label("")
+            self._set_optional(self.lbl_overage, "")
 
-    # ── 7-Day forecast ──
+    # ── Mode switching ──
+
+    _MODE_LABELS = {
+        "claude": "Claude Subscription Usage",
+        "ollama": "Ollama Subscription Usage",
+        "codex": "Codex Subscription Usage",
+    }
+    _ALL_PROVIDERS = (("claude", "Claude"), ("ollama", "Ollama"), ("codex", "Codex"))
 
     @staticmethod
-    def _forecast_7d(util, reset_ts):
-        """Predict if 7d limit will be hit based on current usage rate."""
-        PERIOD = 7 * 24 * 3600  # 7 days in seconds
+    def _config_path():
+        return Path.home() / ".config" / "claude-status-tray" / "config.json"
+
+    def _load_config(self):
+        try:
+            return json.loads(self._config_path().read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self):
+        path = self._config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(
+            {"disabled_providers": sorted(self._disabled_providers)}, indent=2,
+        ))
+
+    def _rebuild_switch_menu(self):
+        targets = [
+            (mid, label) for mid, label in self._ALL_PROVIDERS
+            if mid != self._mode and mid not in self._disabled_providers
+        ]
+
+        # Remove the previously-rendered Switch-to item (if any). Recreating from
+        # scratch is required because dbusmenu keeps the submenu indicator after
+        # set_submenu(None).
+        if self.item_switch is not None:
+            self.menu.remove(self.item_switch)
+            self.item_switch = None
+
+        if not targets:
+            return
+
+        children = self.menu.get_children()
+        position = children.index(self._switch_anchor) + 1
+
+        if len(targets) == 1:
+            mode_id, mode_label = targets[0]
+            new_item = Gtk.MenuItem(label=f"Switch to {mode_label}")
+            new_item.connect("activate", self._switch_mode, mode_id)
+        else:
+            submenu = Gtk.Menu()
+            for mode_id, mode_label in targets:
+                child = Gtk.MenuItem(label=mode_label)
+                child.connect("activate", self._switch_mode, mode_id)
+                submenu.append(child)
+            submenu.show_all()
+            new_item = Gtk.MenuItem(label="Switch to…")
+            new_item.set_submenu(submenu)
+
+        new_item.show()
+        self.menu.insert(new_item, position)
+        self.item_switch = new_item
+
+    def _update_provider_check_sensitivity(self):
+        for mode_id, (check, _) in self._provider_check_items.items():
+            check.set_sensitive(mode_id != self._mode)
+
+    def _toggle_provider(self, check, mode_id):
+        enabled = check.get_active()
+        if not enabled and mode_id == self._mode:
+            # Active provider can't be disabled — revert silently.
+            handler_id = self._provider_check_items[mode_id][1]
+            check.handler_block(handler_id)
+            check.set_active(True)
+            check.handler_unblock(handler_id)
+            return
+        if enabled:
+            self._disabled_providers.discard(mode_id)
+        else:
+            self._disabled_providers.add(mode_id)
+        self._save_config()
+        self._rebuild_switch_menu()
+
+    def _switch_mode(self, _widget, mode_id):
+        if mode_id == self._mode:
+            return
+        self._mode = mode_id
+        self.lbl_header.set_label(self._MODE_LABELS[mode_id])
+        self.indicator.set_title(f"{mode_id.capitalize()} Usage")
+        self._update_provider_check_sensitivity()
+        self._rebuild_switch_menu()
+        self._fetch_bg()
+
+    def _update_menu_ollama(self, data):
+        if isinstance(data, str):
+            self.lbl_5h_title.set_label("5-Hour Window")
+            self.lbl_5h_bar.set_label(f"⚠️ {data}")
+            self._set_optional(self.lbl_5h_reset, "")
+            self.lbl_7d_title.set_label("7-Day Window")
+            self.lbl_7d_bar.set_label("")
+            self._set_optional(self.lbl_7d_reset, "")
+            self._set_optional(self.lbl_7d_forecast, "")
+            self._set_optional(self.lbl_plan, "")
+            self._set_optional(self.lbl_overage, "")
+            return
+
+        # Session usage
+        session = data["session_pct"] / 100.0
+        session_icon = "✅" if session < 0.5 else ("⚠️" if session < 0.8 else "🔴")
+        self.lbl_5h_title.set_label(
+            f"{session_icon} 5-Hour Window        {data['session_pct']:.0f}%"
+        )
+        self.lbl_5h_bar.set_label(_bar(session))
+        self._set_optional(
+            self.lbl_5h_reset,
+            f"Resets in {data['session_reset']}" if data.get("session_reset") else "",
+        )
+
+        # Weekly usage
+        weekly = data["weekly_pct"] / 100.0
+        weekly_icon = "✅" if weekly < 0.5 else ("⚠️" if weekly < 0.8 else "🔴")
+        self.lbl_7d_title.set_label(
+            f"{weekly_icon} 7-Day Window         {data['weekly_pct']:.1f}%"
+        )
+        self.lbl_7d_bar.set_label(_bar(weekly))
+        self._set_optional(
+            self.lbl_7d_reset,
+            f"Resets in {data['weekly_reset']}" if data.get("weekly_reset") else "",
+        )
+        self._set_optional(self.lbl_7d_forecast, "")
+
+        # Plan
+        self._set_optional(self.lbl_plan, f"Plan: {data['plan']}")
+        self._set_optional(self.lbl_overage, "")
+
+    def _update_menu_codex(self, data):
+        if isinstance(data, str):
+            self.lbl_5h_title.set_label("5-Hour Window")
+            self.lbl_5h_bar.set_label(f"⚠️ {data}")
+            self._set_optional(self.lbl_5h_reset, "")
+            self.lbl_7d_title.set_label("7-Day Window")
+            self.lbl_7d_bar.set_label("")
+            self._set_optional(self.lbl_7d_reset, "")
+            self._set_optional(self.lbl_7d_forecast, "")
+            self._set_optional(self.lbl_plan, "")
+            self._set_optional(self.lbl_overage, "")
+            return
+
+        # Primary window (e.g. 5h)
+        p_pct = data["primary_pct"] / 100.0
+        p_icon = "✅" if p_pct < 0.5 else ("⚠️" if p_pct < 0.8 else "🔴")
+        self.lbl_5h_title.set_label(
+            f"{p_icon} 5-Hour Window        {data['primary_pct']}%"
+        )
+        self.lbl_5h_bar.set_label(_bar(p_pct))
+        self._set_optional(
+            self.lbl_5h_reset,
+            f"Resets {_local_time(data['primary_reset_ts'])} · {_time_until(data['primary_reset_ts'])} left"
+            if data.get("primary_reset_ts") else "",
+        )
+
+        # Secondary window (e.g. 7d)
+        s_pct = data["secondary_pct"] / 100.0
+        s_icon = "✅" if s_pct < 0.5 else ("⚠️" if s_pct < 0.8 else "🔴")
+        self.lbl_7d_title.set_label(
+            f"{s_icon} 7-Day Window         {data['secondary_pct']}%"
+        )
+        self.lbl_7d_bar.set_label(_bar(s_pct))
+        self._set_optional(
+            self.lbl_7d_reset,
+            f"Resets {_local_time(data['secondary_reset_ts'])} · {_time_until(data['secondary_reset_ts'], show_days=True)} left"
+            if data.get("secondary_reset_ts") else "",
+        )
+        if data.get("secondary_reset_ts") and data.get("secondary_window_min"):
+            self._set_optional(
+                self.lbl_7d_forecast,
+                self._forecast_window(
+                    s_pct, data["secondary_reset_ts"], data["secondary_window_min"] * 60,
+                ),
+            )
+        else:
+            self._set_optional(self.lbl_7d_forecast, "")
+
+        # Plan & status
+        self._set_optional(self.lbl_plan, f"Plan: {data['plan']}")
+        self._set_optional(
+            self.lbl_overage,
+            "🔴 Rate limit reached!" if data.get("limit_reached") else "",
+        )
+
+    # ── Window forecast ──
+
+    @staticmethod
+    def _forecast_window(util, reset_ts, period_seconds):
+        """Predict if a usage limit will be hit at the current rate within `period_seconds`."""
         now = time.time()
         remaining = reset_ts - now
-        elapsed = PERIOD - remaining
+        elapsed = period_seconds - remaining
 
         if elapsed <= 0 or util <= 0:
             return ""
 
-        projected = util / elapsed * PERIOD
+        projected = util / elapsed * period_seconds
         if projected >= 1.0:
-            # Estimate when 100% is reached
             secs_to_full = (1.0 - util) / (util / elapsed)
             if secs_to_full <= 0:
                 return "⚠️ Limit already reached"
@@ -433,6 +948,10 @@ class ClaudeTray:
         else:
             pct = projected * 100
             return f"✅ ~{pct:.0f}% projected by reset at this pace"
+
+    @classmethod
+    def _forecast_7d(cls, util, reset_ts):
+        return cls._forecast_window(util, reset_ts, 7 * 24 * 3600)
 
     # ── Incidents ──
 
@@ -506,7 +1025,7 @@ class ClaudeTray:
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=Claude Status Tray\n"
-            f"Exec=python3 {script_path}\n"
+            f'Exec=bash -lc "python3 {script_path}"\n'
             "X-GNOME-Autostart-enabled=true\n"
         )
         self._autostart_path().write_text(desktop_content)
@@ -521,9 +1040,18 @@ class ClaudeTray:
         self._spinner_idx = 0
         self._spinner_tid = GLib.timeout_add(80, self._spin_tick)
 
+        mode = self._mode
+
         def worker():
-            data = fetch_usage_data()
-            incidents = fetch_incidents()
+            if mode == "ollama":
+                data = fetch_ollama_usage()
+                incidents = []
+            elif mode == "codex":
+                data = fetch_codex_usage()
+                incidents = []
+            else:
+                data = fetch_usage_data()
+                incidents = fetch_incidents()
             GLib.idle_add(self._on_data, data, incidents)
         threading.Thread(target=worker, daemon=True).start()
         return True  # keep periodic timer
@@ -541,27 +1069,41 @@ class ClaudeTray:
         self.item_refresh.set_label("⟳ Refresh")
         self._fetching = False
         self.cached_data = data
-        self._update_menu(data)
+        if self._mode == "ollama":
+            self._update_menu_ollama(data)
+        elif self._mode == "codex":
+            self._update_menu_codex(data)
+        else:
+            self._update_menu(data)
         self._update_incidents(incidents)
         self._update_icon(data)
 
     def _update_icon(self, data):
         has_incidents = bool(getattr(self, "_incidents", None))
+        prefix = self._mode
+        title = f"{self._mode.capitalize()} Usage"
 
         if isinstance(data, str):
             self.indicator.set_icon_full(
-                _icon_path("default", alert=has_incidents), "Claude Usage"
+                _icon_path("default", alert=has_incidents, prefix=prefix), title
             )
             return
-        h5 = data.get("h5_util", 0)
-        if h5 >= 0.8:
+
+        if self._mode == "ollama":
+            pct = data.get("session_pct", 0) / 100.0
+        elif self._mode == "codex":
+            pct = data.get("primary_pct", 0) / 100.0
+        else:
+            pct = data.get("h5_util", 0)
+
+        if pct >= 0.8:
             color = "red"
-        elif h5 >= 0.5:
+        elif pct >= 0.5:
             color = "orange"
         else:
             color = "green"
         self.indicator.set_icon_full(
-            _icon_path(color, alert=has_incidents), "Claude Usage"
+            _icon_path(color, alert=has_incidents, prefix=prefix), title
         )
 
 
