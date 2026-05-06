@@ -333,27 +333,84 @@ def fetch_ollama_usage():
 _CODEX_BIN_CACHE = None
 
 
+def _codex_candidate_paths():
+    home = os.path.expanduser("~")
+    patterns = [
+        ".nvm/versions/node/*/bin/codex",
+        ".fnm/node-versions/*/installation/bin/codex",
+        ".local/share/fnm/node-versions/*/installation/bin/codex",
+    ]
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(sorted(glob.glob(os.path.join(home, pattern)), reverse=True))
+    candidates.extend([
+        os.path.join(home, ".volta/bin/codex"),
+        os.path.join(home, ".asdf/shims/codex"),
+        os.path.join(home, ".local/bin/codex"),
+        os.path.join(home, ".npm-global/bin/codex"),
+        os.path.join(home, "bin/codex"),
+        "/usr/local/bin/codex",
+    ])
+    return candidates
+
+
 def _resolve_codex_binary():
     """Locate the codex CLI even when the tray is launched without nvm in PATH."""
     global _CODEX_BIN_CACHE
-    if _CODEX_BIN_CACHE is not None:
-        return _CODEX_BIN_CACHE or None
+    if _CODEX_BIN_CACHE:
+        if os.path.isfile(_CODEX_BIN_CACHE) and os.access(_CODEX_BIN_CACHE, os.X_OK):
+            return _CODEX_BIN_CACHE
+        _CODEX_BIN_CACHE = None
 
     found = shutil.which("codex")
     if not found:
-        candidates = []
-        home = os.path.expanduser("~")
-        candidates.extend(sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True))
-        candidates.append(os.path.join(home, ".local/bin/codex"))
-        candidates.append(os.path.join(home, "bin/codex"))
-        candidates.append("/usr/local/bin/codex")
-        for path in candidates:
+        for path in _codex_candidate_paths():
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 found = path
                 break
 
-    _CODEX_BIN_CACHE = found or ""
+    if found:
+        _CODEX_BIN_CACHE = found
     return found
+
+
+def _codex_path_dirs(codex_bin):
+    """PATH entries needed by codex and its node runtime in desktop autostart."""
+    dirs = []
+
+    def add_dir(path):
+        if path and path not in dirs:
+            dirs.append(path)
+
+    codex_path = Path(codex_bin)
+    add_dir(str(codex_path.parent))
+
+    paths = [codex_path]
+    try:
+        paths.append(codex_path.resolve())
+    except OSError:
+        pass
+
+    for path in paths:
+        for parent in path.parents:
+            node_bin = parent / "bin" / "node"
+            if node_bin.is_file() and os.access(node_bin, os.X_OK):
+                add_dir(str(node_bin.parent))
+                break
+
+    for candidate in _codex_candidate_paths():
+        node_bin = Path(candidate).with_name("node")
+        if node_bin.is_file() and os.access(node_bin, os.X_OK):
+            add_dir(str(node_bin.parent))
+
+    return dirs
+
+
+def _prepend_path_dirs(env, dirs):
+    current = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    prefix = [p for p in dirs if p and p not in current]
+    if prefix:
+        env["PATH"] = os.pathsep.join(prefix + current)
 
 
 def _parse_codex_rate_limits_legacy(text):
@@ -428,9 +485,7 @@ def fetch_codex_usage():
     try:
         env = os.environ.copy()
         env["RUST_LOG"] = "trace"
-        bin_dir = os.path.dirname(codex_bin)
-        if bin_dir and bin_dir not in env.get("PATH", "").split(os.pathsep):
-            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        _prepend_path_dirs(env, _codex_path_dirs(codex_bin))
 
         result = subprocess.run(
             [codex_bin, "exec", "say ok"],
@@ -528,19 +583,34 @@ class ClaudeTray:
         self._fetching = False
         self._spinner_idx = 0
         self._spinner_tid = None
-        self._mode = "claude"  # "claude", "ollama", or "codex"
         cfg = self._load_config()
-        self._disabled_providers = set(cfg.get("disabled_providers", []))
+        valid_modes = {mode_id for mode_id, _ in self._ALL_PROVIDERS}
+        disabled_cfg = cfg.get("disabled_providers", [])
+        if not isinstance(disabled_cfg, list):
+            disabled_cfg = []
+        self._disabled_providers = {
+            mode_id for mode_id in disabled_cfg
+            if mode_id in valid_modes
+        }
+        self._mode = cfg.get("active_provider")
+        if not isinstance(self._mode, str) or self._mode not in valid_modes:
+            self._mode = "claude"
+        if self._mode in self._disabled_providers:
+            self._mode = next(
+                (mode_id for mode_id, _ in self._ALL_PROVIDERS
+                 if mode_id not in self._disabled_providers),
+                "claude",
+            )
         self._disabled_providers.discard(self._mode)
 
         self.indicator = AyatanaAppIndicator3.Indicator.new(
             "claude-usage-tray",
-            _icon_path("default"),
+            _icon_path("default", prefix=self._mode),
             AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
         )
         self.indicator.set_icon_theme_path(ICON_DIR)
         self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("Claude Usage")
+        self.indicator.set_title(f"{self._mode.capitalize()} Usage")
 
         self._build_menu()
         self.indicator.set_menu(self.menu)
@@ -554,7 +624,7 @@ class ClaudeTray:
         self.menu.set_name("usage-menu")
 
         # ── Header ──
-        self.lbl_header = Gtk.MenuItem(label="Claude Subscription Usage")
+        self.lbl_header = Gtk.MenuItem(label=self._MODE_LABELS[self._mode])
         self.lbl_header.set_sensitive(False)
         self.menu.append(self.lbl_header)
 
@@ -754,9 +824,10 @@ class ClaudeTray:
     def _save_config(self):
         path = self._config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(
-            {"disabled_providers": sorted(self._disabled_providers)}, indent=2,
-        ))
+        cfg = self._load_config()
+        cfg["active_provider"] = self._mode
+        cfg["disabled_providers"] = sorted(self._disabled_providers)
+        path.write_text(json.dumps(cfg, indent=2) + "\n")
 
     def _rebuild_switch_menu(self):
         targets = [
@@ -819,10 +890,13 @@ class ClaudeTray:
         if mode_id == self._mode:
             return
         self._mode = mode_id
+        self._disabled_providers.discard(self._mode)
+        self._save_config()
         self.lbl_header.set_label(self._MODE_LABELS[mode_id])
         self.indicator.set_title(f"{mode_id.capitalize()} Usage")
         self._update_provider_check_sensitivity()
         self._rebuild_switch_menu()
+        self._set_loading()
         self._fetch_bg()
 
     def _update_menu_ollama(self, data):
@@ -1052,7 +1126,7 @@ class ClaudeTray:
             else:
                 data = fetch_usage_data()
                 incidents = fetch_incidents()
-            GLib.idle_add(self._on_data, data, incidents)
+            GLib.idle_add(self._on_data, mode, data, incidents)
         threading.Thread(target=worker, daemon=True).start()
         return True  # keep periodic timer
 
@@ -1062,12 +1136,15 @@ class ClaudeTray:
         self._spinner_idx += 1
         return True
 
-    def _on_data(self, data, incidents):
+    def _on_data(self, mode, data, incidents):
         if self._spinner_tid:
             GLib.source_remove(self._spinner_tid)
             self._spinner_tid = None
         self.item_refresh.set_label("⟳ Refresh")
         self._fetching = False
+        if mode != self._mode:
+            self._fetch_bg()
+            return False
         self.cached_data = data
         if self._mode == "ollama":
             self._update_menu_ollama(data)
@@ -1077,6 +1154,7 @@ class ClaudeTray:
             self._update_menu(data)
         self._update_incidents(incidents)
         self._update_icon(data)
+        return False
 
     def _update_icon(self, data):
         has_incidents = bool(getattr(self, "_incidents", None))

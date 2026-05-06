@@ -242,27 +242,169 @@ def fetch_ollama():
 _CODEX_BIN_CACHE = None
 
 
+def _codex_candidate_paths():
+    home = os.path.expanduser("~")
+    patterns = [
+        ".nvm/versions/node/*/bin/codex",
+        ".fnm/node-versions/*/installation/bin/codex",
+        ".local/share/fnm/node-versions/*/installation/bin/codex",
+    ]
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(sorted(glob.glob(os.path.join(home, pattern)), reverse=True))
+    candidates.extend([
+        os.path.join(home, ".volta/bin/codex"),
+        os.path.join(home, ".asdf/shims/codex"),
+        os.path.join(home, ".local/bin/codex"),
+        os.path.join(home, ".npm-global/bin/codex"),
+        os.path.join(home, "bin/codex"),
+        "/usr/local/bin/codex",
+    ])
+    return candidates
+
+
 def _resolve_codex_binary():
     """Locate the codex CLI even when launched without nvm in PATH."""
     global _CODEX_BIN_CACHE
-    if _CODEX_BIN_CACHE is not None:
-        return _CODEX_BIN_CACHE or None
+    if _CODEX_BIN_CACHE:
+        if os.path.isfile(_CODEX_BIN_CACHE) and os.access(_CODEX_BIN_CACHE, os.X_OK):
+            return _CODEX_BIN_CACHE
+        _CODEX_BIN_CACHE = None
 
     found = shutil.which("codex")
     if not found:
-        candidates = []
-        home = os.path.expanduser("~")
-        candidates.extend(sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/bin/codex")), reverse=True))
-        candidates.append(os.path.join(home, ".local/bin/codex"))
-        candidates.append(os.path.join(home, "bin/codex"))
-        candidates.append("/usr/local/bin/codex")
-        for path in candidates:
+        for path in _codex_candidate_paths():
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 found = path
                 break
 
-    _CODEX_BIN_CACHE = found or ""
+    if found:
+        _CODEX_BIN_CACHE = found
     return found
+
+
+def _codex_path_dirs(codex_bin):
+    dirs = []
+
+    def add_dir(path):
+        if path and path not in dirs:
+            dirs.append(path)
+
+    codex_path = Path(codex_bin)
+    add_dir(str(codex_path.parent))
+
+    paths = [codex_path]
+    try:
+        paths.append(codex_path.resolve())
+    except OSError:
+        pass
+
+    for path in paths:
+        for parent in path.parents:
+            node_bin = parent / "bin" / "node"
+            if node_bin.is_file() and os.access(node_bin, os.X_OK):
+                add_dir(str(node_bin.parent))
+                break
+
+    for candidate in _codex_candidate_paths():
+        node_bin = Path(candidate).with_name("node")
+        if node_bin.is_file() and os.access(node_bin, os.X_OK):
+            add_dir(str(node_bin.parent))
+
+    return dirs
+
+
+def _prepend_path_dirs(env, dirs):
+    current = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+    prefix = [p for p in dirs if p and p not in current]
+    if prefix:
+        env["PATH"] = os.pathsep.join(prefix + current)
+
+
+def _parse_codex_rate_limits_legacy(text):
+    json_match = re.search(r'(\{"type":"codex\.rate_limits".*?\})\s*$', text, re.MULTILINE)
+    if not json_match:
+        json_match = re.search(r'Received message (\{"type":"codex\.rate_limits".*?\})', text)
+    if not json_match:
+        return None
+    data = json.loads(json_match.group(1))
+    rl = data.get("rate_limits", {})
+    primary = rl.get("primary", {})
+    secondary = rl.get("secondary", {})
+    return {
+        "primary_pct": primary.get("used_percent", 0),
+        "primary_window_min": primary.get("window_minutes", 300),
+        "primary_reset_ts": primary.get("reset_at"),
+        "secondary_pct": secondary.get("used_percent", 0),
+        "secondary_window_min": secondary.get("window_minutes", 10080),
+        "secondary_reset_ts": secondary.get("reset_at"),
+        "plan": data.get("plan_type"),
+        "allowed": rl.get("allowed", True),
+        "limit_reached": rl.get("limit_reached", False),
+    }
+
+
+def _parse_codex_rate_limits_headers(text):
+    def _find(name):
+        m = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text)
+        return m.group(1) if m else None
+
+    plan = _find("X-Codex-Plan-Type")
+    primary_raw = _find("X-Codex-Primary-Used-Percent")
+    if plan is None and primary_raw is None:
+        return None
+
+    def _to_int(v, default=None):
+        if v is None or v == "":
+            return default
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return default
+
+    limit_reached = "usage_limit_reached" in text
+    return {
+        "primary_pct": _to_int(primary_raw, 0),
+        "primary_window_min": _to_int(_find("X-Codex-Primary-Window-Minutes"), 300),
+        "primary_reset_ts": _to_int(_find("X-Codex-Primary-Reset-At")),
+        "secondary_pct": _to_int(_find("X-Codex-Secondary-Used-Percent"), 0),
+        "secondary_window_min": _to_int(_find("X-Codex-Secondary-Window-Minutes"), 10080),
+        "secondary_reset_ts": _to_int(_find("X-Codex-Secondary-Reset-At")),
+        "plan": plan,
+        "allowed": not limit_reached,
+        "limit_reached": limit_reached,
+    }
+
+
+def _window_label(minutes):
+    minutes = minutes or 0
+    if minutes >= 1440 and minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes >= 60 and minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def _format_codex(parsed):
+    p_reset = parsed.get("primary_reset_ts")
+    s_reset = parsed.get("secondary_reset_ts")
+    return {
+        "plan": parsed.get("plan"),
+        "allowed": parsed.get("allowed", True),
+        "limit_reached": parsed.get("limit_reached", False),
+        "primary": {
+            "label": _window_label(parsed.get("primary_window_min", 300)),
+            "utilization": (parsed.get("primary_pct") or 0) / 100.0,
+            "reset_at": _iso_time(p_reset) if p_reset else None,
+            "resets_in": _time_until(p_reset) if p_reset else None,
+        },
+        "secondary": {
+            "label": _window_label(parsed.get("secondary_window_min", 10080)),
+            "utilization": (parsed.get("secondary_pct") or 0) / 100.0,
+            "reset_at": _iso_time(s_reset) if s_reset else None,
+            "resets_in": _time_until(s_reset) if s_reset else None,
+        },
+    }
 
 
 def fetch_codex():
@@ -272,49 +414,19 @@ def fetch_codex():
     try:
         env = os.environ.copy()
         env["RUST_LOG"] = "trace"
-        bin_dir = os.path.dirname(codex_bin)
-        if bin_dir and bin_dir not in env.get("PATH", "").split(os.pathsep):
-            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        _prepend_path_dirs(env, _codex_path_dirs(codex_bin))
         result = subprocess.run(
             [codex_bin, "exec", "say ok"],
             capture_output=True, text=True, timeout=30,
             stdin=subprocess.DEVNULL, env=env,
         )
         output = result.stdout + "\n" + result.stderr
-
-        json_match = re.search(
-            r'(\{"type":"codex\.rate_limits".*?\})\s*$', output, re.MULTILINE)
-        if not json_match:
-            json_match = re.search(
-                r'Received message (\{"type":"codex\.rate_limits".*?\})', output)
-        if not json_match:
+        parsed = _parse_codex_rate_limits_legacy(output)
+        if parsed is None:
+            parsed = _parse_codex_rate_limits_headers(output)
+        if parsed is None:
             return {"error": "No rate limit data from Codex CLI."}
-
-        data = json.loads(json_match.group(1))
-        rl = data.get("rate_limits", {})
-        primary = rl.get("primary", {})
-        secondary = rl.get("secondary", {})
-
-        p_reset = primary.get("reset_at")
-        s_reset = secondary.get("reset_at")
-
-        return {
-            "plan": data.get("plan_type"),
-            "allowed": rl.get("allowed", True),
-            "limit_reached": rl.get("limit_reached", False),
-            "primary": {
-                "label": f"{primary.get('window_minutes', 300) // 60}h",
-                "utilization": primary.get("used_percent", 0) / 100.0,
-                "reset_at": _iso_time(p_reset) if p_reset else None,
-                "resets_in": _time_until(p_reset) if p_reset else None,
-            },
-            "secondary": {
-                "label": f"{secondary.get('window_minutes', 10080) // 1440}d",
-                "utilization": secondary.get("used_percent", 0) / 100.0,
-                "reset_at": _iso_time(s_reset) if s_reset else None,
-                "resets_in": _time_until(s_reset) if s_reset else None,
-            },
-        }
+        return _format_codex(parsed)
     except FileNotFoundError:
         return {"error": "'codex' not found in PATH."}
     except subprocess.TimeoutExpired:
