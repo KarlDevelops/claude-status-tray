@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gi
@@ -75,6 +75,21 @@ def create_icons():
 
 
 # ── Data fetching ────────────────────────────────────────────────────
+
+CONFIG_PATH = Path.home() / ".config" / "claude-status-tray" / "config.json"
+
+
+def _load_config_file():
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config_file(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
 
 def _time_until(reset_ts, show_days=False):
     diff = reset_ts - time.time()
@@ -331,6 +346,12 @@ def fetch_ollama_usage():
 # ── Codex usage (via codex CLI) ─────────────────────────────────────
 
 _CODEX_BIN_CACHE = None
+_CODEX_USAGE_PROMPT = "say ok"
+_CODEX_SESSION_CONFIG_KEY = "codex_usage_session_id"
+_CODEX_LATENCY_LOG_PATH = CONFIG_PATH.parent / "codex_latency.jsonl"
+_CODEX_LATENCY_WINDOWS_HOURS = (6, 12, 18)
+_CODEX_SLOW_STREAK_THRESHOLD = 3
+_UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
 
 def _codex_candidate_paths():
@@ -413,6 +434,348 @@ def _prepend_path_dirs(env, dirs):
         env["PATH"] = os.pathsep.join(prefix + current)
 
 
+def _get_codex_usage_session_id():
+    session_id = _load_config_file().get(_CODEX_SESSION_CONFIG_KEY)
+    if isinstance(session_id, str) and re.fullmatch(_UUID_RE, session_id):
+        return session_id
+    return None
+
+
+def _set_codex_usage_session_id(session_id):
+    if not session_id or not re.fullmatch(_UUID_RE, session_id):
+        return
+    cfg = _load_config_file()
+    if cfg.get(_CODEX_SESSION_CONFIG_KEY) == session_id:
+        return
+    cfg[_CODEX_SESSION_CONFIG_KEY] = session_id
+    _save_config_file(cfg)
+
+
+def _clear_codex_usage_session_id(session_id):
+    cfg = _load_config_file()
+    if cfg.get(_CODEX_SESSION_CONFIG_KEY) == session_id:
+        cfg.pop(_CODEX_SESSION_CONFIG_KEY, None)
+        _save_config_file(cfg)
+
+
+def _extract_codex_session_id(text):
+    patterns = [
+        rf"\bconversation\.id=({_UUID_RE})",
+        rf"\bthread_id=({_UUID_RE})",
+        rf"thread ID: Some\(ThreadId \{{ uuid: ({_UUID_RE}) \}}\)",
+        rf'"thread_id"\s*:\s*"({_UUID_RE})"',
+        rf"rollout-[^\s\"]*-({_UUID_RE})\.jsonl",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def _codex_resume_failed(text):
+    lower = text.lower()
+    return (
+        "no recorded session" in lower
+        or "not found" in lower and "session" in lower
+        or "failed to resume" in lower
+        or "thread/resume" in lower and "error" in lower
+    )
+
+
+def _run_codex_usage_probe(codex_bin, env, session_id=None):
+    if session_id:
+        args = [codex_bin, "exec", "resume", session_id, _CODEX_USAGE_PROMPT]
+    else:
+        args = [codex_bin, "exec", _CODEX_USAGE_PROMPT]
+    started_at = datetime.now(timezone.utc)
+    started_mono = time.monotonic()
+    attempt = {
+        "started_at": started_at.isoformat(),
+        "resumed": bool(session_id),
+        "session_id": session_id,
+        "timeout": False,
+        "returncode": None,
+    }
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, env=env,
+        )
+        output = result.stdout + "\n" + result.stderr
+        attempt["returncode"] = result.returncode
+    except subprocess.TimeoutExpired as exc:
+        result = None
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        output = stdout + "\n" + stderr
+        attempt["timeout"] = True
+    attempt["duration_seconds"] = round(time.monotonic() - started_mono, 3)
+    return result, output, attempt
+
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _round_seconds(value):
+    return round(value, 3) if _is_number(value) else None
+
+
+def _codex_latency_stats(values):
+    values = sorted(v for v in values if _is_number(v))
+    if not values:
+        return {
+            "count": 0,
+            "avg_seconds": None,
+            "median_seconds": None,
+            "p90_seconds": None,
+        }
+    mid = len(values) // 2
+    if len(values) % 2:
+        median = values[mid]
+    else:
+        median = (values[mid - 1] + values[mid]) / 2
+    p90_idx = max(0, min(len(values) - 1, (len(values) * 90 + 99) // 100 - 1))
+    return {
+        "count": len(values),
+        "avg_seconds": _round_seconds(sum(values) / len(values)),
+        "median_seconds": _round_seconds(median),
+        "p90_seconds": _round_seconds(values[p90_idx]),
+    }
+
+
+def _load_codex_latency_records():
+    records = []
+    try:
+        with _CODEX_LATENCY_LOG_PATH.open() as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = _parse_iso_datetime(record.get("timestamp") or record.get("started_at"))
+                if ts is None:
+                    continue
+                record["_ts"] = ts
+                records.append(record)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return records
+
+
+def _summarize_codex_latency(records, now=None):
+    now = now or datetime.now(timezone.utc)
+    windows = {}
+    for hours in _CODEX_LATENCY_WINDOWS_HOURS:
+        cutoff = now - timedelta(hours=hours)
+        subset = [r for r in records if r.get("_ts") and r["_ts"] >= cutoff]
+        successful = [
+            r.get("total_duration_seconds") for r in subset
+            if r.get("success") and not r.get("timeout")
+        ]
+        answers = [
+            r.get("session_answer_seconds") for r in subset
+            if _is_number(r.get("session_answer_seconds"))
+        ]
+        turns = [
+            r.get("session_turn_seconds") for r in subset
+            if _is_number(r.get("session_turn_seconds"))
+        ]
+        windows[f"{hours}h"] = {
+            "records": len(subset),
+            "timeouts": sum(1 for r in subset if r.get("timeout")),
+            "total": _codex_latency_stats(successful),
+            "session_answer": _codex_latency_stats(answers),
+            "session_turn": _codex_latency_stats(turns),
+        }
+    latest = max(records, key=lambda r: r["_ts"], default=None)
+    latest_summary = None
+    if latest:
+        latest_summary = {
+            "timestamp": latest.get("timestamp"),
+            "total_duration_seconds": latest.get("total_duration_seconds"),
+            "session_answer_seconds": latest.get("session_answer_seconds"),
+            "session_turn_seconds": latest.get("session_turn_seconds"),
+            "timeout": latest.get("timeout", False),
+            "warning": latest.get("warning", False),
+        }
+    return {"windows": windows, "latest": latest_summary}
+
+
+def _find_codex_session_file(session_id):
+    if not session_id:
+        return None
+    base = Path.home() / ".codex" / "sessions"
+    try:
+        matches = list(base.rglob(f"*{session_id}.jsonl"))
+    except Exception:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def _latest_codex_session_latency(session_id, since=None):
+    session_file = _find_codex_session_file(session_id)
+    if session_file is None:
+        return None
+
+    latest = None
+    current = None
+    try:
+        with session_file.open() as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = _parse_iso_datetime(event.get("timestamp"))
+                if ts is None:
+                    continue
+                payload = event.get("payload") or {}
+                payload_type = payload.get("type")
+                if event.get("type") == "event_msg" and payload_type == "task_started":
+                    if current and not current.get("ignore"):
+                        latest = current
+                    current = {"task_started": ts}
+                    continue
+                if current is None or event.get("type") != "event_msg":
+                    continue
+                if payload_type == "user_message":
+                    if payload.get("message") == _CODEX_USAGE_PROMPT:
+                        current["user_message"] = ts
+                    else:
+                        current["ignore"] = True
+                elif payload_type == "agent_message":
+                    current.setdefault("agent_message", ts)
+                elif payload_type == "task_complete":
+                    current.setdefault("task_complete", ts)
+        if current and not current.get("ignore"):
+            latest = current
+    except Exception:
+        return None
+
+    if not latest or "user_message" not in latest or "agent_message" not in latest:
+        return None
+    if since and latest["user_message"] < since - timedelta(seconds=10):
+        return None
+
+    task_end = latest.get("task_complete") or latest["agent_message"]
+    return {
+        "session_file": str(session_file),
+        "session_user_at": latest["user_message"].isoformat(),
+        "session_agent_at": latest["agent_message"].isoformat(),
+        "session_answer_seconds": _round_seconds(
+            (latest["agent_message"] - latest["user_message"]).total_seconds()
+        ),
+        "session_turn_seconds": _round_seconds(
+            (task_end - latest.get("task_started", latest["user_message"])).total_seconds()
+        ),
+    }
+
+
+def _evaluate_codex_latency(record, previous_records, previous_summary):
+    reasons = []
+    duration = record.get("total_duration_seconds")
+    if record.get("timeout"):
+        reasons.append("timeout")
+    elif _is_number(duration):
+        total_18h = previous_summary["windows"]["18h"]["total"]
+        total_6h = previous_summary["windows"]["6h"]["total"]
+        p90_18h = total_18h.get("p90_seconds")
+        median_6h = total_6h.get("median_seconds")
+        if total_18h.get("count", 0) >= 5 and _is_number(p90_18h) and duration > p90_18h:
+            reasons.append(f"above 18h p90 ({p90_18h:.1f}s)")
+        if total_6h.get("count", 0) >= 3 and _is_number(median_6h) and duration > median_6h * 2:
+            reasons.append(f"above 2x 6h median ({median_6h:.1f}s)")
+
+    current_bad = bool(reasons)
+    streak = 1 if current_bad else 0
+    if current_bad:
+        for previous in reversed(previous_records):
+            if previous.get("warning") or previous.get("timeout"):
+                streak += 1
+            else:
+                break
+        if streak >= _CODEX_SLOW_STREAK_THRESHOLD:
+            reasons.append(f"{streak} slow checks in a row")
+
+    return {
+        "warning": bool(reasons),
+        "warning_reasons": reasons,
+        "slow_streak": streak if current_bad else 0,
+    }
+
+
+def _append_codex_latency_record(record):
+    try:
+        _CODEX_LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _CODEX_LATENCY_LOG_PATH.open("a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _record_codex_latency(started_at, total_duration, attempts, session_id, output, success, error=None):
+    session_latency = _latest_codex_session_latency(session_id, started_at)
+    previous_records = _load_codex_latency_records()
+    previous_summary = _summarize_codex_latency(previous_records)
+    record = {
+        "timestamp": started_at.isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "success": bool(success),
+        "error": error,
+        "timeout": any(a.get("timeout") for a in attempts),
+        "resume_retried": len(attempts) > 1,
+        "attempts": attempts,
+        "total_duration_seconds": _round_seconds(total_duration),
+    }
+    if session_latency:
+        record.update(session_latency)
+
+    record.update(_evaluate_codex_latency(record, previous_records, previous_summary))
+    clean_record = {k: v for k, v in record.items() if not k.startswith("_")}
+    _append_codex_latency_record(clean_record)
+
+    current_record = dict(clean_record)
+    current_record["_ts"] = started_at
+    summary = _summarize_codex_latency(previous_records + [current_record])
+    return {
+        "current": {
+            "timestamp": clean_record.get("timestamp"),
+            "total_duration_seconds": clean_record.get("total_duration_seconds"),
+            "session_answer_seconds": clean_record.get("session_answer_seconds"),
+            "session_turn_seconds": clean_record.get("session_turn_seconds"),
+            "success": clean_record.get("success"),
+            "timeout": clean_record.get("timeout"),
+            "warning": clean_record.get("warning"),
+            "warning_reasons": clean_record.get("warning_reasons"),
+            "slow_streak": clean_record.get("slow_streak"),
+        },
+        "windows": summary["windows"],
+        "latest": summary["latest"],
+        "log_path": str(_CODEX_LATENCY_LOG_PATH),
+    }
+
+
 def _parse_codex_rate_limits_legacy(text):
     """Old codex format (<=0.124): a {"type":"codex.rate_limits", ...} websocket message."""
     json_match = re.search(r'(\{"type":"codex\.rate_limits".*?\})\s*$', text, re.MULTILINE)
@@ -478,34 +841,58 @@ def _parse_codex_rate_limits_headers(text):
 
 
 def fetch_codex_usage():
-    """Fetch Codex usage by running a minimal codex exec and parsing rate_limits."""
+    """Fetch Codex usage by reusing one tray-owned codex exec session."""
     codex_bin = _resolve_codex_binary()
     if not codex_bin:
         return "'codex' not found in PATH."
+    started_at = datetime.now(timezone.utc)
+    started_mono = time.monotonic()
+    attempts = []
     try:
         env = os.environ.copy()
         env["RUST_LOG"] = "trace"
         _prepend_path_dirs(env, _codex_path_dirs(codex_bin))
 
-        result = subprocess.run(
-            [codex_bin, "exec", "say ok"],
-            capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL, env=env,
-        )
-
-        output = result.stdout + "\n" + result.stderr
+        session_id = _get_codex_usage_session_id()
+        result, output, attempt = _run_codex_usage_probe(codex_bin, env, session_id)
+        attempts.append(attempt)
+        if attempt.get("timeout"):
+            _record_codex_latency(
+                started_at, time.monotonic() - started_mono, attempts,
+                session_id, output, False, "timeout",
+            )
+            return "Timeout fetching Codex data."
+        if session_id and result and result.returncode != 0 and _codex_resume_failed(output):
+            _clear_codex_usage_session_id(session_id)
+            session_id = None
+            result, output, attempt = _run_codex_usage_probe(codex_bin, env)
+            attempts.append(attempt)
+            if attempt.get("timeout"):
+                _record_codex_latency(
+                    started_at, time.monotonic() - started_mono, attempts,
+                    session_id, output, False, "timeout",
+                )
+                return "Timeout fetching Codex data."
 
         parsed = _parse_codex_rate_limits_legacy(output)
         if parsed is None:
             parsed = _parse_codex_rate_limits_headers(output)
+        new_session_id = _extract_codex_session_id(output)
+        if parsed is not None and new_session_id:
+            _set_codex_usage_session_id(new_session_id)
+        effective_session_id = new_session_id or session_id
+        latency = _record_codex_latency(
+            started_at, time.monotonic() - started_mono, attempts,
+            effective_session_id, output, parsed is not None,
+            None if parsed is not None else "no_rate_limit_data",
+        )
         if parsed is None:
             return "No rate limit data from Codex CLI."
+        parsed["latency"] = latency
         return parsed
 
     except FileNotFoundError:
         return "'codex' not found in PATH."
-    except subprocess.TimeoutExpired:
-        return "Timeout fetching Codex data."
     except Exception as e:
         return f"Codex fetch error: {e}"
 
@@ -567,6 +954,14 @@ def _status_icon(status):
     if "warning" in status:
         return "⚠️"
     return "🔴"
+
+
+def _fmt_latency_seconds(value):
+    if not _is_number(value):
+        return "n/a"
+    if value >= 10:
+        return f"{value:.0f}s"
+    return f"{value:.1f}s"
 
 
 # ── Tray App ─────────────────────────────────────────────────────────
@@ -673,6 +1068,14 @@ class ClaudeTray:
         self.lbl_overage.set_sensitive(False)
         self.menu.append(self.lbl_overage)
 
+        self.lbl_latency = Gtk.MenuItem()
+        self.lbl_latency.set_sensitive(False)
+        self.menu.append(self.lbl_latency)
+
+        self.lbl_latency_history = Gtk.MenuItem()
+        self.lbl_latency_history.set_sensitive(False)
+        self.menu.append(self.lbl_latency_history)
+
         # ── Incidents (dynamic, hidden when empty) ──
         self.incident_sep = Gtk.SeparatorMenuItem()
         self.menu.append(self.incident_sep)
@@ -690,13 +1093,18 @@ class ClaudeTray:
         # because the AppIndicator/dbusmenu bridge does not drop the submenu arrow
         # when only set_submenu(None) is called on an existing item.
         self._switch_anchor = Gtk.SeparatorMenuItem()
-        self._switch_anchor.set_visible(False)
+        self._switch_anchor.set_no_show_all(True)
+        self._switch_anchor.hide()
         self.menu.append(self._switch_anchor)
         self.item_switch = None
+
+        self._switch_tail_sep = Gtk.SeparatorMenuItem()
+        self._switch_tail_sep.set_no_show_all(True)
+        self._switch_tail_sep.hide()
+        self.menu.append(self._switch_tail_sep)
         self._rebuild_switch_menu()
 
         # ── Autostart ──
-        self.menu.append(Gtk.SeparatorMenuItem())
         self.item_autostart = Gtk.MenuItem()
         self._update_autostart_item()
         self.menu.append(self.item_autostart)
@@ -744,6 +1152,8 @@ class ClaudeTray:
         self._set_optional(self.lbl_7d_forecast, "")
         self._set_optional(self.lbl_plan, "")
         self._set_optional(self.lbl_overage, "")
+        self._set_optional(self.lbl_latency, "")
+        self._set_optional(self.lbl_latency_history, "")
 
     def _update_menu(self, data):
         if isinstance(data, str):
@@ -756,6 +1166,8 @@ class ClaudeTray:
             self._set_optional(self.lbl_7d_forecast, "")
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
+            self._set_optional(self.lbl_latency, "")
+            self._set_optional(self.lbl_latency_history, "")
             return
 
         # 5-Hour
@@ -801,6 +1213,8 @@ class ClaudeTray:
             self._set_optional(self.lbl_overage, f"Extra Usage: {lbl}")
         else:
             self._set_optional(self.lbl_overage, "")
+        self._set_optional(self.lbl_latency, "")
+        self._set_optional(self.lbl_latency_history, "")
 
     # ── Mode switching ──
 
@@ -813,21 +1227,16 @@ class ClaudeTray:
 
     @staticmethod
     def _config_path():
-        return Path.home() / ".config" / "claude-status-tray" / "config.json"
+        return CONFIG_PATH
 
     def _load_config(self):
-        try:
-            return json.loads(self._config_path().read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return _load_config_file()
 
     def _save_config(self):
-        path = self._config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
         cfg = self._load_config()
         cfg["active_provider"] = self._mode
         cfg["disabled_providers"] = sorted(self._disabled_providers)
-        path.write_text(json.dumps(cfg, indent=2) + "\n")
+        _save_config_file(cfg)
 
     def _rebuild_switch_menu(self):
         targets = [
@@ -843,8 +1252,12 @@ class ClaudeTray:
             self.item_switch = None
 
         if not targets:
+            self._switch_anchor.hide()
+            self._switch_tail_sep.hide()
             return
 
+        self._switch_anchor.show()
+        self._switch_tail_sep.show()
         children = self.menu.get_children()
         position = children.index(self._switch_anchor) + 1
 
@@ -910,6 +1323,8 @@ class ClaudeTray:
             self._set_optional(self.lbl_7d_forecast, "")
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
+            self._set_optional(self.lbl_latency, "")
+            self._set_optional(self.lbl_latency_history, "")
             return
 
         # Session usage
@@ -940,6 +1355,45 @@ class ClaudeTray:
         # Plan
         self._set_optional(self.lbl_plan, f"Plan: {data['plan']}")
         self._set_optional(self.lbl_overage, "")
+        self._set_optional(self.lbl_latency, "")
+        self._set_optional(self.lbl_latency_history, "")
+
+    def _update_codex_latency_rows(self, latency):
+        if not latency:
+            self._set_optional(self.lbl_latency, "")
+            self._set_optional(self.lbl_latency_history, "")
+            return
+
+        current = latency.get("current") or {}
+        windows = latency.get("windows") or {}
+        total = current.get("total_duration_seconds")
+        answer = current.get("session_answer_seconds")
+        warning = current.get("warning") or current.get("timeout")
+        prefix = "⚠️" if warning else "⏱"
+        parts = [f"{prefix} Latency: {_fmt_latency_seconds(total)} total"]
+        if _is_number(answer):
+            parts.append(f"{_fmt_latency_seconds(answer)} answer")
+        reasons = current.get("warning_reasons") or []
+        if reasons:
+            parts.append(reasons[0])
+        self._set_optional(self.lbl_latency, " · ".join(parts))
+
+        def total_stat(window, key):
+            return (windows.get(window) or {}).get("total", {}).get(key)
+
+        avg_6h = total_stat("6h", "avg_seconds")
+        avg_12h = total_stat("12h", "avg_seconds")
+        avg_18h = total_stat("18h", "avg_seconds")
+        p90_18h = total_stat("18h", "p90_seconds")
+        n_18h = (windows.get("18h") or {}).get("records", 0)
+        history = (
+            "Avg 6/12/18h: "
+            f"{_fmt_latency_seconds(avg_6h)}/"
+            f"{_fmt_latency_seconds(avg_12h)}/"
+            f"{_fmt_latency_seconds(avg_18h)} · "
+            f"p90 18h {_fmt_latency_seconds(p90_18h)} · n={n_18h}"
+        )
+        self._set_optional(self.lbl_latency_history, history)
 
     def _update_menu_codex(self, data):
         if isinstance(data, str):
@@ -952,6 +1406,8 @@ class ClaudeTray:
             self._set_optional(self.lbl_7d_forecast, "")
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
+            self._set_optional(self.lbl_latency, "")
+            self._set_optional(self.lbl_latency_history, "")
             return
 
         # Primary window (e.g. 5h)
@@ -995,6 +1451,7 @@ class ClaudeTray:
             self.lbl_overage,
             "🔴 Rate limit reached!" if data.get("limit_reached") else "",
         )
+        self._update_codex_latency_rows(data.get("latency"))
 
     # ── Window forecast ──
 
