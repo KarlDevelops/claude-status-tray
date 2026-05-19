@@ -24,6 +24,7 @@ from pathlib import Path
 
 # ── Shared helpers ──────────────────────────────────────────────────
 
+APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".config" / "claude-status-tray" / "config.json"
 
 
@@ -409,7 +410,7 @@ def _run_codex_usage_probe(codex_bin, env, session_id=None):
         result = subprocess.run(
             args,
             capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL, env=env,
+            stdin=subprocess.DEVNULL, env=env, cwd=str(APP_DIR),
         )
         output = result.stdout + "\n" + result.stderr
         attempt["returncode"] = result.returncode

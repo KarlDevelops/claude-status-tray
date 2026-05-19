@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -76,6 +77,7 @@ def create_icons():
 
 # ── Data fetching ────────────────────────────────────────────────────
 
+APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".config" / "claude-status-tray" / "config.json"
 
 
@@ -501,7 +503,7 @@ def _run_codex_usage_probe(codex_bin, env, session_id=None):
         result = subprocess.run(
             args,
             capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL, env=env,
+            stdin=subprocess.DEVNULL, env=env, cwd=str(APP_DIR),
         )
         output = result.stdout + "\n" + result.stderr
         attempt["returncode"] = result.returncode
@@ -956,14 +958,6 @@ def _status_icon(status):
     return "🔴"
 
 
-def _fmt_latency_seconds(value):
-    if not _is_number(value):
-        return "n/a"
-    if value >= 10:
-        return f"{value:.0f}s"
-    return f"{value:.1f}s"
-
-
 # ── Tray App ─────────────────────────────────────────────────────────
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -1072,10 +1066,6 @@ class ClaudeTray:
         self.lbl_latency.set_sensitive(False)
         self.menu.append(self.lbl_latency)
 
-        self.lbl_latency_history = Gtk.MenuItem()
-        self.lbl_latency_history.set_sensitive(False)
-        self.menu.append(self.lbl_latency_history)
-
         # ── Incidents (dynamic, hidden when empty) ──
         self.incident_sep = Gtk.SeparatorMenuItem()
         self.menu.append(self.incident_sep)
@@ -1153,7 +1143,6 @@ class ClaudeTray:
         self._set_optional(self.lbl_plan, "")
         self._set_optional(self.lbl_overage, "")
         self._set_optional(self.lbl_latency, "")
-        self._set_optional(self.lbl_latency_history, "")
 
     def _update_menu(self, data):
         if isinstance(data, str):
@@ -1167,7 +1156,6 @@ class ClaudeTray:
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
             self._set_optional(self.lbl_latency, "")
-            self._set_optional(self.lbl_latency_history, "")
             return
 
         # 5-Hour
@@ -1214,7 +1202,6 @@ class ClaudeTray:
         else:
             self._set_optional(self.lbl_overage, "")
         self._set_optional(self.lbl_latency, "")
-        self._set_optional(self.lbl_latency_history, "")
 
     # ── Mode switching ──
 
@@ -1324,7 +1311,6 @@ class ClaudeTray:
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
             self._set_optional(self.lbl_latency, "")
-            self._set_optional(self.lbl_latency_history, "")
             return
 
         # Session usage
@@ -1356,44 +1342,18 @@ class ClaudeTray:
         self._set_optional(self.lbl_plan, f"Plan: {data['plan']}")
         self._set_optional(self.lbl_overage, "")
         self._set_optional(self.lbl_latency, "")
-        self._set_optional(self.lbl_latency_history, "")
 
     def _update_codex_latency_rows(self, latency):
         if not latency:
             self._set_optional(self.lbl_latency, "")
-            self._set_optional(self.lbl_latency_history, "")
             return
 
         current = latency.get("current") or {}
-        windows = latency.get("windows") or {}
-        total = current.get("total_duration_seconds")
-        answer = current.get("session_answer_seconds")
         warning = current.get("warning") or current.get("timeout")
-        prefix = "⚠️" if warning else "⏱"
-        parts = [f"{prefix} Latency: {_fmt_latency_seconds(total)} total"]
-        if _is_number(answer):
-            parts.append(f"{_fmt_latency_seconds(answer)} answer")
-        reasons = current.get("warning_reasons") or []
-        if reasons:
-            parts.append(reasons[0])
-        self._set_optional(self.lbl_latency, " · ".join(parts))
-
-        def total_stat(window, key):
-            return (windows.get(window) or {}).get("total", {}).get(key)
-
-        avg_6h = total_stat("6h", "avg_seconds")
-        avg_12h = total_stat("12h", "avg_seconds")
-        avg_18h = total_stat("18h", "avg_seconds")
-        p90_18h = total_stat("18h", "p90_seconds")
-        n_18h = (windows.get("18h") or {}).get("records", 0)
-        history = (
-            "Avg 6/12/18h: "
-            f"{_fmt_latency_seconds(avg_6h)}/"
-            f"{_fmt_latency_seconds(avg_12h)}/"
-            f"{_fmt_latency_seconds(avg_18h)} · "
-            f"p90 18h {_fmt_latency_seconds(p90_18h)} · n={n_18h}"
-        )
-        self._set_optional(self.lbl_latency_history, history)
+        if warning:
+            self._set_optional(self.lbl_latency, "⚠️ Speed: slower than usual")
+        else:
+            self._set_optional(self.lbl_latency, "✅ Speed: normal")
 
     def _update_menu_codex(self, data):
         if isinstance(data, str):
@@ -1407,7 +1367,6 @@ class ClaudeTray:
             self._set_optional(self.lbl_plan, "")
             self._set_optional(self.lbl_overage, "")
             self._set_optional(self.lbl_latency, "")
-            self._set_optional(self.lbl_latency_history, "")
             return
 
         # Primary window (e.g. 5h)
@@ -1550,13 +1509,15 @@ class ClaudeTray:
 
     def _enable_autostart(self, _widget):
         script_path = Path(os.path.abspath(__file__))
+        app_dir = script_path.parent
         desktop_dir = Path.home() / ".config" / "autostart"
         desktop_dir.mkdir(parents=True, exist_ok=True)
+        exec_cmd = f"cd {shlex.quote(str(app_dir))} && exec python3 {shlex.quote(str(script_path))}"
         desktop_content = (
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=Claude Status Tray\n"
-            f'Exec=bash -lc "python3 {script_path}"\n'
+            f"Exec=bash -lc {shlex.quote(exec_cmd)}\n"
             "X-GNOME-Autostart-enabled=true\n"
         )
         self._autostart_path().write_text(desktop_content)
