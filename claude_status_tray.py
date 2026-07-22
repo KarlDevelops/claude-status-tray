@@ -779,43 +779,76 @@ def _record_codex_latency(started_at, total_duration, attempts, session_id, outp
 
 
 def _parse_codex_rate_limits_legacy(text):
-    """Old codex format (<=0.124): a {"type":"codex.rate_limits", ...} websocket message."""
-    json_match = re.search(r'(\{"type":"codex\.rate_limits".*?\})\s*$', text, re.MULTILINE)
-    if not json_match:
-        json_match = re.search(r'Received message (\{"type":"codex\.rate_limits".*?\})', text)
-    if not json_match:
+    """Parse codex.rate_limits websocket messages from Codex trace output."""
+    data = None
+    for line in text.splitlines():
+        raw = line.split("Received message ", 1)[-1]
+        json_start = raw.find("{")
+        if json_start < 0:
+            continue
+        try:
+            candidate, _ = json.JSONDecoder().raw_decode(raw[json_start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("type") == "codex.rate_limits":
+            data = candidate
+    if data is None:
         return None
-    try:
-        data = json.loads(json_match.group(1))
-    except json.JSONDecodeError:
+
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
         return None
-    rl = data.get("rate_limits", {})
-    primary = rl.get("primary", {})
-    secondary = rl.get("secondary", {})
+    primary = rl.get("primary")
+    secondary = rl.get("secondary")
+    primary_available = isinstance(primary, dict)
+    secondary_available = isinstance(secondary, dict)
+    if not primary_available and not secondary_available:
+        return None
+    primary = primary if primary_available else {}
+    secondary = secondary if secondary_available else {}
     return {
-        "primary_pct": primary.get("used_percent", 0),
-        "primary_window_min": primary.get("window_minutes", 300),
+        "primary_available": primary_available,
+        "primary_pct": primary.get("used_percent", 0) if primary_available else None,
+        "primary_window_min": primary.get("window_minutes") if primary_available else None,
         "primary_reset_ts": primary.get("reset_at"),
         "primary_reset_secs": primary.get("reset_after_seconds"),
-        "secondary_pct": secondary.get("used_percent", 0),
-        "secondary_window_min": secondary.get("window_minutes", 10080),
+        "secondary_available": secondary_available,
+        "secondary_pct": secondary.get("used_percent", 0) if secondary_available else None,
+        "secondary_window_min": secondary.get("window_minutes") if secondary_available else None,
         "secondary_reset_ts": secondary.get("reset_at"),
         "secondary_reset_secs": secondary.get("reset_after_seconds"),
-        "plan": data.get("plan_type", "unknown"),
+        "plan": data.get("plan_type") or "unknown",
         "allowed": rl.get("allowed", True),
         "limit_reached": rl.get("limit_reached", False),
     }
 
 
 def _parse_codex_rate_limits_headers(text):
-    """New codex format (>=0.125): X-Codex-* fields embedded in websocket event JSON."""
+    """Parse X-Codex-* fields embedded in Codex trace output."""
     def _find(name):
-        m = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text)
+        m = re.search(
+            rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text, re.IGNORECASE,
+        )
         return m.group(1) if m else None
 
     plan = _find("X-Codex-Plan-Type")
     primary_raw = _find("X-Codex-Primary-Used-Percent")
-    if plan is None and primary_raw is None:
+    primary_window = _find("X-Codex-Primary-Window-Minutes")
+    primary_reset = _find("X-Codex-Primary-Reset-At")
+    primary_reset_secs = _find("X-Codex-Primary-Reset-After-Seconds")
+    secondary_raw = _find("X-Codex-Secondary-Used-Percent")
+    secondary_window = _find("X-Codex-Secondary-Window-Minutes")
+    secondary_reset = _find("X-Codex-Secondary-Reset-At")
+    secondary_reset_secs = _find("X-Codex-Secondary-Reset-After-Seconds")
+    primary_available = any(
+        value is not None
+        for value in (primary_raw, primary_window, primary_reset, primary_reset_secs)
+    )
+    secondary_available = any(
+        value is not None
+        for value in (secondary_raw, secondary_window, secondary_reset, secondary_reset_secs)
+    )
+    if not primary_available and not secondary_available:
         return None
 
     def _to_int(v, default=None):
@@ -828,14 +861,16 @@ def _parse_codex_rate_limits_headers(text):
 
     limit_reached = "usage_limit_reached" in text
     return {
-        "primary_pct": _to_int(primary_raw, 0),
-        "primary_window_min": _to_int(_find("X-Codex-Primary-Window-Minutes"), 300),
-        "primary_reset_ts": _to_int(_find("X-Codex-Primary-Reset-At")),
-        "primary_reset_secs": _to_int(_find("X-Codex-Primary-Reset-After-Seconds")),
-        "secondary_pct": _to_int(_find("X-Codex-Secondary-Used-Percent"), 0),
-        "secondary_window_min": _to_int(_find("X-Codex-Secondary-Window-Minutes"), 10080),
-        "secondary_reset_ts": _to_int(_find("X-Codex-Secondary-Reset-At")),
-        "secondary_reset_secs": _to_int(_find("X-Codex-Secondary-Reset-After-Seconds")),
+        "primary_available": primary_available,
+        "primary_pct": _to_int(primary_raw, 0) if primary_available else None,
+        "primary_window_min": _to_int(primary_window) if primary_available else None,
+        "primary_reset_ts": _to_int(primary_reset),
+        "primary_reset_secs": _to_int(primary_reset_secs),
+        "secondary_available": secondary_available,
+        "secondary_pct": _to_int(secondary_raw, 0) if secondary_available else None,
+        "secondary_window_min": _to_int(secondary_window) if secondary_available else None,
+        "secondary_reset_ts": _to_int(secondary_reset),
+        "secondary_reset_secs": _to_int(secondary_reset_secs),
         "plan": plan or "unknown",
         "allowed": not limit_reached,
         "limit_reached": limit_reached,
@@ -958,6 +993,18 @@ def _status_icon(status):
     return "🔴"
 
 
+def _codex_window_title(minutes):
+    if not minutes:
+        return "Usage Window"
+    if minutes >= 1440 and minutes % 1440 == 0:
+        days = minutes // 1440
+        return f"{days}-Day Window"
+    if minutes >= 60 and minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}-Hour Window"
+    return f"{minutes}-Minute Window"
+
+
 # ── Tray App ─────────────────────────────────────────────────────────
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -1032,7 +1079,8 @@ class ClaudeTray:
         self.lbl_5h_reset.set_sensitive(False)
         self.menu.append(self.lbl_5h_reset)
 
-        self.menu.append(Gtk.SeparatorMenuItem())
+        self.window_sep = Gtk.SeparatorMenuItem()
+        self.menu.append(self.window_sep)
 
         # ── 7-Day section ──
         self.lbl_7d_title = Gtk.MenuItem()
@@ -1133,11 +1181,12 @@ class ClaudeTray:
             item.hide()
 
     def _set_loading(self):
-        self.lbl_5h_title.set_label("5-Hour Window")
-        self.lbl_5h_bar.set_label("Loading…")
+        self._set_optional(self.lbl_5h_title, "5-Hour Window")
+        self._set_optional(self.lbl_5h_bar, "Loading…")
         self._set_optional(self.lbl_5h_reset, "")
-        self.lbl_7d_title.set_label("7-Day Window")
-        self.lbl_7d_bar.set_label("Loading…")
+        self.window_sep.show()
+        self._set_optional(self.lbl_7d_title, "7-Day Window")
+        self._set_optional(self.lbl_7d_bar, "Loading…")
         self._set_optional(self.lbl_7d_reset, "")
         self._set_optional(self.lbl_7d_forecast, "")
         self._set_optional(self.lbl_plan, "")
@@ -1357,11 +1406,12 @@ class ClaudeTray:
 
     def _update_menu_codex(self, data):
         if isinstance(data, str):
-            self.lbl_5h_title.set_label("5-Hour Window")
-            self.lbl_5h_bar.set_label(f"⚠️ {data}")
+            self._set_optional(self.lbl_5h_title, "Codex Usage")
+            self._set_optional(self.lbl_5h_bar, f"⚠️ {data}")
             self._set_optional(self.lbl_5h_reset, "")
-            self.lbl_7d_title.set_label("7-Day Window")
-            self.lbl_7d_bar.set_label("")
+            self.window_sep.hide()
+            self._set_optional(self.lbl_7d_title, "")
+            self._set_optional(self.lbl_7d_bar, "")
             self._set_optional(self.lbl_7d_reset, "")
             self._set_optional(self.lbl_7d_forecast, "")
             self._set_optional(self.lbl_plan, "")
@@ -1369,36 +1419,56 @@ class ClaudeTray:
             self._set_optional(self.lbl_latency, "")
             return
 
-        # Primary window (e.g. 5h)
-        p_pct = data["primary_pct"] / 100.0
-        p_icon = "✅" if p_pct < 0.5 else ("⚠️" if p_pct < 0.8 else "🔴")
-        self.lbl_5h_title.set_label(
-            f"{p_icon} 5-Hour Window        {data['primary_pct']}%"
-        )
-        self.lbl_5h_bar.set_label(_bar(p_pct))
-        self._set_optional(
-            self.lbl_5h_reset,
-            f"Resets {_local_time(data['primary_reset_ts'])} · {_time_until(data['primary_reset_ts'])} left"
-            if data.get("primary_reset_ts") else "",
-        )
+        windows = []
+        for prefix in ("primary", "secondary"):
+            available = data.get(
+                f"{prefix}_available", data.get(f"{prefix}_pct") is not None,
+            )
+            if available:
+                windows.append({
+                    "pct": data.get(f"{prefix}_pct") or 0,
+                    "window_min": data.get(f"{prefix}_window_min"),
+                    "reset_ts": data.get(f"{prefix}_reset_ts"),
+                })
+        windows.sort(key=lambda window: window.get("window_min") or 0)
 
-        # Secondary window (e.g. 7d)
-        s_pct = data["secondary_pct"] / 100.0
-        s_icon = "✅" if s_pct < 0.5 else ("⚠️" if s_pct < 0.8 else "🔴")
-        self.lbl_7d_title.set_label(
-            f"{s_icon} 7-Day Window         {data['secondary_pct']}%"
-        )
-        self.lbl_7d_bar.set_label(_bar(s_pct))
-        self._set_optional(
-            self.lbl_7d_reset,
-            f"Resets {_local_time(data['secondary_reset_ts'])} · {_time_until(data['secondary_reset_ts'], show_days=True)} left"
-            if data.get("secondary_reset_ts") else "",
-        )
-        if data.get("secondary_reset_ts") and data.get("secondary_window_min"):
+        first = windows[0] if windows else None
+        second = windows[1] if len(windows) > 1 else None
+        if len(windows) == 1 and (windows[0].get("window_min") or 0) >= 1440:
+            first, second = None, windows[0]
+
+        def render_window(window, title_item, bar_item, reset_item):
+            if window is None:
+                self._set_optional(title_item, "")
+                self._set_optional(bar_item, "")
+                self._set_optional(reset_item, "")
+                return
+            pct = window["pct"] / 100.0
+            icon = "✅" if pct < 0.5 else ("⚠️" if pct < 0.8 else "🔴")
+            title = _codex_window_title(window.get("window_min"))
+            self._set_optional(title_item, f"{icon} {title}        {window['pct']}%")
+            self._set_optional(bar_item, _bar(pct))
+            reset_ts = window.get("reset_ts")
+            show_days = (window.get("window_min") or 0) >= 1440
+            self._set_optional(
+                reset_item,
+                f"Resets {_local_time(reset_ts)} · {_time_until(reset_ts, show_days=show_days)} left"
+                if reset_ts else "",
+            )
+
+        render_window(first, self.lbl_5h_title, self.lbl_5h_bar, self.lbl_5h_reset)
+        render_window(second, self.lbl_7d_title, self.lbl_7d_bar, self.lbl_7d_reset)
+        if first is not None and second is not None:
+            self.window_sep.show()
+        else:
+            self.window_sep.hide()
+
+        if second and second.get("reset_ts") and second.get("window_min"):
+            s_pct = second["pct"] / 100.0
             self._set_optional(
                 self.lbl_7d_forecast,
                 self._forecast_window(
-                    s_pct, data["secondary_reset_ts"], data["secondary_window_min"] * 60,
+                    s_pct, second["reset_ts"], second["window_min"] * 60,
                 ),
             )
         else:
@@ -1588,7 +1658,10 @@ class ClaudeTray:
         if self._mode == "ollama":
             pct = data.get("session_pct", 0) / 100.0
         elif self._mode == "codex":
-            pct = data.get("primary_pct", 0) / 100.0
+            pct = max(
+                data.get("primary_pct") or 0,
+                data.get("secondary_pct") or 0,
+            ) / 100.0
         else:
             pct = data.get("h5_util", 0)
 

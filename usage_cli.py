@@ -686,23 +686,44 @@ def _record_codex_latency(started_at, total_duration, attempts, session_id, outp
 
 
 def _parse_codex_rate_limits_legacy(text):
-    json_match = re.search(r'(\{"type":"codex\.rate_limits".*?\})\s*$', text, re.MULTILINE)
-    if not json_match:
-        json_match = re.search(r'Received message (\{"type":"codex\.rate_limits".*?\})', text)
-    if not json_match:
+    data = None
+    for line in text.splitlines():
+        raw = line.split("Received message ", 1)[-1]
+        json_start = raw.find("{")
+        if json_start < 0:
+            continue
+        try:
+            candidate, _ = json.JSONDecoder().raw_decode(raw[json_start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("type") == "codex.rate_limits":
+            data = candidate
+    if data is None:
         return None
-    data = json.loads(json_match.group(1))
-    rl = data.get("rate_limits", {})
-    primary = rl.get("primary", {})
-    secondary = rl.get("secondary", {})
+
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+    primary = rl.get("primary")
+    secondary = rl.get("secondary")
+    primary_available = isinstance(primary, dict)
+    secondary_available = isinstance(secondary, dict)
+    if not primary_available and not secondary_available:
+        return None
+    primary = primary if primary_available else {}
+    secondary = secondary if secondary_available else {}
     return {
-        "primary_pct": primary.get("used_percent", 0),
-        "primary_window_min": primary.get("window_minutes", 300),
+        "primary_available": primary_available,
+        "primary_pct": primary.get("used_percent", 0) if primary_available else None,
+        "primary_window_min": primary.get("window_minutes") if primary_available else None,
         "primary_reset_ts": primary.get("reset_at"),
-        "secondary_pct": secondary.get("used_percent", 0),
-        "secondary_window_min": secondary.get("window_minutes", 10080),
+        "primary_reset_secs": primary.get("reset_after_seconds"),
+        "secondary_available": secondary_available,
+        "secondary_pct": secondary.get("used_percent", 0) if secondary_available else None,
+        "secondary_window_min": secondary.get("window_minutes") if secondary_available else None,
         "secondary_reset_ts": secondary.get("reset_at"),
-        "plan": data.get("plan_type"),
+        "secondary_reset_secs": secondary.get("reset_after_seconds"),
+        "plan": data.get("plan_type") or "unknown",
         "allowed": rl.get("allowed", True),
         "limit_reached": rl.get("limit_reached", False),
     }
@@ -710,12 +731,29 @@ def _parse_codex_rate_limits_legacy(text):
 
 def _parse_codex_rate_limits_headers(text):
     def _find(name):
-        m = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text)
+        m = re.search(
+            rf'"{re.escape(name)}"\s*:\s*"([^"]*)"', text, re.IGNORECASE,
+        )
         return m.group(1) if m else None
 
     plan = _find("X-Codex-Plan-Type")
     primary_raw = _find("X-Codex-Primary-Used-Percent")
-    if plan is None and primary_raw is None:
+    primary_window = _find("X-Codex-Primary-Window-Minutes")
+    primary_reset = _find("X-Codex-Primary-Reset-At")
+    primary_reset_secs = _find("X-Codex-Primary-Reset-After-Seconds")
+    secondary_raw = _find("X-Codex-Secondary-Used-Percent")
+    secondary_window = _find("X-Codex-Secondary-Window-Minutes")
+    secondary_reset = _find("X-Codex-Secondary-Reset-At")
+    secondary_reset_secs = _find("X-Codex-Secondary-Reset-After-Seconds")
+    primary_available = any(
+        value is not None
+        for value in (primary_raw, primary_window, primary_reset, primary_reset_secs)
+    )
+    secondary_available = any(
+        value is not None
+        for value in (secondary_raw, secondary_window, secondary_reset, secondary_reset_secs)
+    )
+    if not primary_available and not secondary_available:
         return None
 
     def _to_int(v, default=None):
@@ -728,13 +766,17 @@ def _parse_codex_rate_limits_headers(text):
 
     limit_reached = "usage_limit_reached" in text
     return {
-        "primary_pct": _to_int(primary_raw, 0),
-        "primary_window_min": _to_int(_find("X-Codex-Primary-Window-Minutes"), 300),
-        "primary_reset_ts": _to_int(_find("X-Codex-Primary-Reset-At")),
-        "secondary_pct": _to_int(_find("X-Codex-Secondary-Used-Percent"), 0),
-        "secondary_window_min": _to_int(_find("X-Codex-Secondary-Window-Minutes"), 10080),
-        "secondary_reset_ts": _to_int(_find("X-Codex-Secondary-Reset-At")),
-        "plan": plan,
+        "primary_available": primary_available,
+        "primary_pct": _to_int(primary_raw, 0) if primary_available else None,
+        "primary_window_min": _to_int(primary_window) if primary_available else None,
+        "primary_reset_ts": _to_int(primary_reset),
+        "primary_reset_secs": _to_int(primary_reset_secs),
+        "secondary_available": secondary_available,
+        "secondary_pct": _to_int(secondary_raw, 0) if secondary_available else None,
+        "secondary_window_min": _to_int(secondary_window) if secondary_available else None,
+        "secondary_reset_ts": _to_int(secondary_reset),
+        "secondary_reset_secs": _to_int(secondary_reset_secs),
+        "plan": plan or "unknown",
         "allowed": not limit_reached,
         "limit_reached": limit_reached,
     }
@@ -752,6 +794,12 @@ def _window_label(minutes):
 def _format_codex(parsed):
     p_reset = parsed.get("primary_reset_ts")
     s_reset = parsed.get("secondary_reset_ts")
+    primary_available = parsed.get(
+        "primary_available", parsed.get("primary_pct") is not None,
+    )
+    secondary_available = parsed.get(
+        "secondary_available", parsed.get("secondary_pct") is not None,
+    )
     formatted = {
         "plan": parsed.get("plan"),
         "allowed": parsed.get("allowed", True),
@@ -761,13 +809,13 @@ def _format_codex(parsed):
             "utilization": (parsed.get("primary_pct") or 0) / 100.0,
             "reset_at": _iso_time(p_reset) if p_reset else None,
             "resets_in": _time_until(p_reset) if p_reset else None,
-        },
+        } if primary_available else None,
         "secondary": {
             "label": _window_label(parsed.get("secondary_window_min", 10080)),
             "utilization": (parsed.get("secondary_pct") or 0) / 100.0,
             "reset_at": _iso_time(s_reset) if s_reset else None,
             "resets_in": _time_until(s_reset) if s_reset else None,
-        },
+        } if secondary_available else None,
     }
     if parsed.get("latency"):
         formatted["latency"] = parsed["latency"]
